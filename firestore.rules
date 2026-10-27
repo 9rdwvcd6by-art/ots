@@ -1,0 +1,252 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* ==================================================================
+       Helpers
+       ================================================================== */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function myProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function myRole() {
+      return myProfile().role;
+    }
+    function myOrgId() {
+      return myProfile().organizationId;
+    }
+    function myScopedProjects() {
+      return myProfile().scopedProjectIds;
+    }
+
+    function isSuperAdmin() { return isSignedIn() && myRole() == 'superAdmin'; }
+    function isMainAdmin()  { return isSignedIn() && myRole() == 'admin'; }
+    function isSubAdmin()   { return isSignedIn() && myRole() == 'subAdmin'; }
+    function isAnyAdmin()   { return isMainAdmin() || isSubAdmin(); }
+
+    function belongsToOrg(orgId) {
+      return isSignedIn() && myOrgId() == orgId;
+    }
+
+    /* Sub-admin may only touch projects in their scope; superAdmin/mainAdmin
+       have unlimited access within their org. */
+    function inMyScope(projectId) {
+      return isMainAdmin()
+        || (isSubAdmin() && projectId in myScopedProjects());
+    }
+
+    /* ==================================================================
+       ORGANIZATIONS
+       - superAdmin: full read/write/delete on every org
+       - admin/subAdmin: read own org only
+       - Self-registration: any signed-in user can create ONE org
+         whose createdBy == their uid (rules enforce the shape)
+       ================================================================== */
+    match /organizations/{orgId} {
+
+      /* Read */
+      allow read: if isSuperAdmin() || belongsToOrg(orgId);
+
+      /* Create — self-service OR by superAdmin */
+      allow create: if isSignedIn() && (
+        isSuperAdmin() ||
+        (
+          request.resource.data.createdBy == request.auth.uid &&
+          request.resource.data.name is string &&
+          request.resource.data.name.size() >= 2 &&
+          request.resource.data.name.size() <= 100
+        )
+      );
+
+      /* Update / delete — superAdmin or the org's own main admin */
+      allow update, delete: if isSuperAdmin() || (
+        isMainAdmin() && belongsToOrg(orgId)
+      );
+    }
+
+    /* ==================================================================
+       USERS
+       Read:
+         - self
+         - superAdmin → any user
+         - admin/subAdmin → users in their org
+       Create:
+         - superAdmin → any profile (including org admins)
+         - main admin → users in their org (non-superAdmin roles)
+         - subAdmin → users in their org (only contractor/engineer/etc.)
+         - Self-registration: user creates their OWN admin profile
+       Update:
+         - self (except role/org changes unless admin)
+         - superAdmin → any
+         - main admin → users in their org (non-superAdmin)
+       Delete:
+         - superAdmin → any (except self)
+         - main admin → users in their org (except self & superAdmins)
+       ================================================================== */
+    match /users/{uid} {
+
+      /* Read */
+      allow read: if isSignedIn() && (
+        request.auth.uid == uid ||
+        isSuperAdmin() ||
+        (
+          isAnyAdmin() &&
+          resource.data.organizationId == myOrgId()
+        )
+      );
+
+      /* Create */
+      allow create: if isSignedIn() && (
+        isSuperAdmin() ||
+        (
+          isMainAdmin() &&
+          request.resource.data.organizationId == myOrgId() &&
+          request.resource.data.role != 'superAdmin'
+        ) ||
+        (
+          isSubAdmin() &&
+          request.resource.data.organizationId == myOrgId() &&
+          !['admin', 'subAdmin', 'superAdmin'].includes(request.resource.data.role)
+        ) ||
+        /* Self-registration: user creates their own admin profile */
+        (
+          request.auth.uid == uid &&
+          request.resource.data.organizationId is string &&
+          request.resource.data.role == 'admin'
+        )
+      );
+
+      /* Update */
+      allow update: if isSignedIn() && (
+        isSuperAdmin() ||
+        (
+          isMainAdmin() &&
+          resource.data.organizationId == myOrgId() &&
+          resource.data.role != 'superAdmin'
+        ) ||
+        (
+          isSubAdmin() &&
+          resource.data.organizationId == myOrgId() &&
+          !['admin', 'subAdmin', 'superAdmin'].includes(resource.data.role)
+        ) ||
+        /* Self update: can change name/display name, but not role or org */
+        (
+          request.auth.uid == uid &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.organizationId == resource.data.organizationId
+        )
+      );
+
+      /* Delete */
+      allow delete: if isSignedIn() && request.auth.uid != uid && (
+        isSuperAdmin() ||
+        (
+          isMainAdmin() &&
+          resource.data.organizationId == myOrgId() &&
+          resource.data.role != 'superAdmin'
+        ) ||
+        (
+          isSubAdmin() &&
+          resource.data.organizationId == myOrgId() &&
+          !['admin', 'subAdmin', 'superAdmin'].includes(resource.data.role)
+        )
+      );
+    }
+
+    /* ==================================================================
+       PROJECTS
+       - Read: any signed-in user in the same org; subAdmins see only
+               their scoped projects
+       - Create: superAdmin OR main admin (any project in their org)
+       - Update/delete: superAdmin OR main admin (any project in their org)
+       ================================================================== */
+    match /projects/{projectId} {
+
+      allow read: if isSignedIn() && (
+        isSuperAdmin() ||
+        (
+          resource.data.organizationId == myOrgId() &&
+          (isMainAdmin() || !isSubAdmin() || projectId in myScopedProjects())
+        )
+      );
+
+      allow create: if isSignedIn() && (
+        isSuperAdmin() ||
+        (
+          isMainAdmin() &&
+          request.resource.data.organizationId == myOrgId()
+        )
+      );
+
+      allow update, delete: if isSignedIn() && (
+        isSuperAdmin() ||
+        (
+          isMainAdmin() &&
+          resource.data.organizationId == myOrgId()
+        )
+      );
+    }
+
+    /* ==================================================================
+       OVERTIME REQUESTS
+       - Read: any signed-in user in the same org; subAdmins see only
+               requests for scoped projects; participants always see
+               their own requests
+       - Create: contractor creates for self, OR inspector creates
+                 internal (isInternal: true); both must be in own org
+       - Update: any signed-in user in the same org (approval chain)
+       - Delete: superAdmin or org admin (mainAdmin or scoped subAdmin)
+       ================================================================== */
+    match /overtime_requests/{reqId} {
+
+      allow read: if isSignedIn() && (
+        isSuperAdmin() ||
+        (
+          resource.data.organizationId == myOrgId() &&
+          (
+            isMainAdmin() ||
+            (isSubAdmin() && resource.data.projectId in myScopedProjects()) ||
+            resource.data.contractorId == request.auth.uid ||
+            resource.data.inspectorId == request.auth.uid ||
+            resource.data.projectEngineerId == request.auth.uid ||
+            resource.data.supervisorId == request.auth.uid ||
+            resource.data.managerId == request.auth.uid
+          )
+        )
+      );
+
+      allow create: if isSignedIn() && (
+        isSuperAdmin() ||
+        (
+          request.resource.data.organizationId == myOrgId() &&
+          (
+            request.resource.data.contractorId == request.auth.uid ||
+            request.resource.data.isInternal == true
+          )
+        )
+      );
+
+      /* Approval chain updates — any signed-in user in the same org
+         (their own profile gating the exact role is handled in the app) */
+      allow update: if isSignedIn() && (
+        isSuperAdmin() ||
+        resource.data.organizationId == myOrgId()
+      );
+
+      allow delete: if isSignedIn() && (
+        isSuperAdmin() ||
+        (
+          isAnyAdmin() &&
+          resource.data.organizationId == myOrgId() &&
+          (
+            isMainAdmin() ||
+            (isSubAdmin() && resource.data.projectId in myScopedProjects())
+          )
+        )
+      );
+    }
+  }
+}
